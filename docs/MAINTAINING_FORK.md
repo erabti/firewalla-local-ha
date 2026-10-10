@@ -37,6 +37,16 @@ PATH="$PWD/.venv/bin:$PATH" bash ./utils/quick_lint.sh
 .venv/bin/python -m pytest tests/ -q
 ```
 
+After an upstream merge or a Firewalla firmware update, check that the
+redaction still hides every secret in the live network config. The command
+prints field names only and fails when a readable field has a secret-looking
+name:
+
+```bash
+ssh firewalla 'curl -s http://localhost:8837/v1/config/active' \
+  | .venv/bin/python utils/check_admin_redaction.py
+```
+
 Also compare the live `getHandler`, `setHandler`, and `cmdHandler` cases in
 `/home/pi/firewalla/controllers/netbot.js` with the allowlists in
 `managers/admin_manager.py`. A Firewalla firmware update can change this private
