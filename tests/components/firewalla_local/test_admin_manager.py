@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,6 +25,68 @@ def _manager(*, get_result: object = None) -> tuple[FirewallaAdminManager, Async
     coordinator = SimpleNamespace(async_request_refresh=AsyncMock())
     manager = FirewallaAdminManager(coordinator, SimpleNamespace(), client)
     return manager, client
+
+
+_WG_PRIVATE_KEY = "made-up-wireguard-private-key"
+_WG_PRESHARED_KEY = "made-up-wireguard-preshared-key"
+_WIFI_KEY = "made-up-wifi-password"
+_MESH_KEY = "made-up-mesh-key"
+_SECRETS = (_WG_PRIVATE_KEY, _WG_PRESHARED_KEY, _WIFI_KEY, _MESH_KEY)
+
+
+def _network_config() -> dict[str, Any]:
+    """Return a made-up network config in the router's layout."""
+    return {
+        "ncid": "current",
+        "nat_passthrough": {},
+        "interface": {
+            "wireguard": {
+                "wg0": {
+                    "listenPort": 51820,
+                    "privateKey": _WG_PRIVATE_KEY,
+                    "peers": [
+                        {
+                            "publicKey": "made-up-peer-public-key",
+                            "presharedKey": _WG_PRESHARED_KEY,
+                            "allowedIPs": ["10.9.0.2/32"],
+                        }
+                    ],
+                }
+            }
+        },
+        "apc": {
+            "assets": {"ap-1": {"publicKey": "made-up-ap-public-key"}},
+            "assets_template": {
+                "ap_default": {
+                    "mesh": {
+                        "ssid": "example-mesh",
+                        "encryption": "sae",
+                        "key": _MESH_KEY,
+                    }
+                }
+            },
+            "profile": {
+                "profile-1": {
+                    "ssid": "Example Home",
+                    "band": "5g",
+                    "encryption": "psk2",
+                    "wpa3": False,
+                    "key": _WIFI_KEY,
+                }
+            },
+        },
+    }
+
+
+def _redacted_network_config() -> dict[str, Any]:
+    """Return the made-up config as a caller should see it."""
+    config = _network_config()
+    wg0 = config["interface"]["wireguard"]["wg0"]
+    wg0["privateKey"] = "[redacted]"
+    wg0["peers"][0]["presharedKey"] = "[redacted]"
+    config["apc"]["assets_template"]["ap_default"]["mesh"]["key"] = "[redacted]"
+    config["apc"]["profile"]["profile-1"]["key"] = "[redacted]"
+    return config
 
 
 @pytest.mark.asyncio
@@ -257,5 +322,195 @@ async def test_admin_execute_rejects_non_allowlisted_item() -> None:
 
     with pytest.raises(ValueError, match="Unsupported"):
         await manager.async_execute("cmd", value={"cmd": "id"})
+
+    client.async_command_item.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_network_config_read_redacts_wifi_and_vpn_keys() -> None:
+    """A read hides the WireGuard, Wi-Fi and mesh keys and nothing else."""
+    manager, _ = _manager(get_result=_network_config())
+
+    response = await manager.async_read("networkConfig")
+
+    assert response["result"] == _redacted_network_config()
+    serialized = json.dumps(response)
+    for secret in _SECRETS:
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "authKey",
+        "key",
+        "pass",
+        "passphrase",
+        "password",
+        "preSharedKey",
+        "psk",
+        "secret",
+        "wpa_passphrase",
+    ],
+)
+@pytest.mark.asyncio
+async def test_admin_read_redacts_secret_fields_at_any_depth(field: str) -> None:
+    """A secret is hidden by its field name, wherever the firmware puts it."""
+    manager, _ = _manager(
+        get_result={"history": [{"moved": [{field: "made-up", "ssid": "Example"}]}]}
+    )
+
+    response = await manager.async_read("networkConfigHistory")
+
+    assert response["result"] == {
+        "history": [{"moved": [{field: "[redacted]", "ssid": "Example"}]}]
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["band", "encryption", "keyMgmt", "nat_passthrough", "publicKey", "public_key"],
+)
+@pytest.mark.asyncio
+async def test_admin_read_keeps_non_secret_fields_readable(field: str) -> None:
+    """Public keys and plain settings stay readable."""
+    manager, _ = _manager(get_result={"nested": [{field: "made-up"}]})
+
+    response = await manager.async_read("networkConfig")
+
+    assert response["result"] == {"nested": [{field: "made-up"}]}
+
+
+@pytest.mark.asyncio
+async def test_network_config_hash_follows_the_raw_config() -> None:
+    """A changed Wi-Fi key changes the hash, though both reads look the same."""
+    manager, client = _manager(get_result=_network_config())
+    first = await manager.async_read("networkConfig")
+    changed = _network_config()
+    changed["apc"]["profile"]["profile-1"]["key"] = "another-made-up-wifi-password"
+    client.async_get_item.return_value = changed
+
+    second = await manager.async_read("networkConfig")
+
+    assert first["result"] == second["result"]
+    assert first["config_hash"] != second["config_hash"]
+
+
+@pytest.mark.asyncio
+async def test_network_config_rollback_restores_the_raw_keys() -> None:
+    """A rollback writes the snapshot's real keys and shows none of them."""
+    manager, client = _manager(get_result=_network_config())
+    original_read = await manager.async_read("networkConfig")
+    changed = _network_config()
+    changed["apc"]["profile"]["profile-1"]["key"] = "another-made-up-wifi-password"
+    client.async_get_item.return_value = changed
+    changed_read = await manager.async_read("networkConfig")
+
+    plan = await manager.async_rollback_network_config(
+        str(original_read["config_hash"])
+    )
+    response = await manager.async_rollback_network_config(
+        str(original_read["config_hash"]),
+        dry_run=False,
+        confirm=True,
+        expected_current_hash=str(changed_read["config_hash"]),
+    )
+
+    assert plan["value"] == _redacted_network_config()
+    serialized = json.dumps([plan, response])
+    for secret in (*_SECRETS, "another-made-up-wifi-password"):
+        assert secret not in serialized
+    client.async_set_item.assert_awaited_once_with(
+        "networkConfig",
+        value={"config": _network_config()},
+        target="0.0.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_network_config_patch_never_writes_the_redaction_placeholder() -> None:
+    """A read sent back as the patch keeps every hidden key on the router."""
+    manager, client = _manager(get_result=_network_config())
+    read_response = await manager.async_read("networkConfig")
+    patch = deepcopy(read_response["result"])
+    patch["apc"]["profile"]["profile-1"]["ssid"] = "Example Renamed"
+
+    await manager.async_execute(
+        "networkConfig",
+        value=patch,
+        dry_run=False,
+        confirm=True,
+        expected_current_hash=str(read_response["config_hash"]),
+        refresh=False,
+    )
+
+    expected = _network_config()
+    expected["apc"]["profile"]["profile-1"]["ssid"] = "Example Renamed"
+    client.async_set_item.assert_awaited_once_with(
+        "networkConfig",
+        value={"config": expected},
+        target="0.0.0.0",
+    )
+    assert "[redacted]" not in json.dumps(client.async_set_item.await_args.kwargs)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        # A new Wi-Fi network has no current key to keep.
+        {"apc": {"profile": {"profile-2": {"ssid": "Guests", "key": "[redacted]"}}}},
+        # A changed list is replaced whole, so its hidden key cannot be kept.
+        {
+            "interface": {
+                "wireguard": {
+                    "wg0": {
+                        "peers": [
+                            {
+                                "publicKey": "made-up-peer-public-key",
+                                "presharedKey": "[redacted]",
+                                "allowedIPs": ["10.9.0.3/32"],
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_network_config_patch_rejects_an_unresolvable_placeholder(
+    patch: dict[str, object],
+) -> None:
+    """A placeholder that stands for no current value stops the write."""
+    manager, client = _manager(get_result=_network_config())
+    read_response = await manager.async_read("networkConfig")
+    client.async_get_item.reset_mock()
+
+    with pytest.raises(ValueError, match="redacted placeholder"):
+        await manager.async_execute(
+            "networkConfig",
+            value=patch,
+            dry_run=False,
+            confirm=True,
+            expected_current_hash=str(read_response["config_hash"]),
+        )
+
+    client.async_set_item.assert_not_awaited()
+    # Only the current config was read: the impact check never saw the patch.
+    client.async_get_item.assert_awaited_once_with("networkConfig")
+
+
+@pytest.mark.asyncio
+async def test_admin_execute_rejects_the_placeholder_in_other_writes() -> None:
+    """A redacted value read from one item is never written by another."""
+    manager, client = _manager()
+
+    with pytest.raises(ValueError, match="redacted placeholder"):
+        await manager.async_execute(
+            "saveVpnProfile",
+            value={"profileId": "home", "config": {"privateKey": "[redacted]"}},
+            dry_run=False,
+            confirm=True,
+        )
 
     client.async_command_item.assert_not_awaited()

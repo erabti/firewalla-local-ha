@@ -594,8 +594,8 @@ data:
 
 The response includes `config_hash`. The manager also keeps the raw configuration
 in a bounded in-memory snapshot cache so rollback does not require exposing
-secrets. Sensitive response fields such as passwords, tokens, private keys, and
-certificates are replaced with `[redacted]`.
+secrets. Sensitive response fields such as passwords, Wi-Fi and mesh keys,
+tokens, private keys, and certificates are replaced with `[redacted]`.
 
 Use `firewalla_local.admin_execute` first without changing its defaults. It
 returns the exact planned message and does not write:
@@ -639,7 +639,9 @@ Common management payloads:
 `networkConfig` is the complete FireRouter configuration and therefore covers
 WAN, LAN, VLAN, routes, DHCP, DNS, wireless, and Smart Queue references present
 in that object. Callers provide only an RFC 7396-style merge patch: omitted and
-redacted values are preserved, while `null` removes a key. The integration
+redacted values are preserved, while `null` removes a key. A `[redacted]`
+value is never written: it keeps the current value, and the patch is refused
+where there is none to keep or inside a changed list. The integration
 applies that patch to a fresh raw read before sending Firewalla's required full
 object. It has two extra gates:
 
