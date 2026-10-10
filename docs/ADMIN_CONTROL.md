@@ -32,9 +32,14 @@ firmware may change the object required by an item.
 | VPN | `ovpnProfiles`, `vpnProfiles` |
 | System and usage | `auditLogs`, `dataPlan`, `publicIp`, `sysInfo`, `timezone` |
 
-The `networkConfig` response also includes `config_hash`. VPN and other
-responses keep their structure but redact keys that look like passwords,
-tokens, private material, credentials, secrets, or certificates.
+The `networkConfig` response also includes `config_hash`. Every response
+keeps its structure, but a field whose name looks like a secret is replaced
+with `[redacted]`, at any depth: passwords, passphrases, PSKs, tokens, private
+material, credentials, secrets, certificates, and any field ending in `key`
+that is not a public key. In `networkConfig` that hides each Wi-Fi network's
+`key` (`apc.profile.<id>.key`), the access points' mesh `key`, and the
+WireGuard `privateKey` values. The rule goes by field name, not by path, so a
+firmware change in the layout stays covered.
 
 ## Set items
 
@@ -143,6 +148,13 @@ complete merged object as `value.config`. This preserves passwords,
 certificates, and other hidden fields. The rollback path uses an internal full
 replacement so it can also remove keys added after the snapshot.
 
+A `[redacted]` value in the patch means "keep the current value", so a read can
+be edited and sent back as it is. The placeholder itself is never written. The
+patch is refused when the placeholder has no current value to stand for (a new
+Wi-Fi network needs its real key), or when it sits inside a list that was
+changed, because a merge patch replaces a list whole. Every other write item
+refuses a value that contains the placeholder.
+
 Rollback uses the same guarded write path: read the new current hash and call
 `admin_rollback_network_config` with the original snapshot hash. Raw snapshots
 are bounded to five and are lost on integration reload or Home Assistant
@@ -157,6 +169,7 @@ restart. `admin_read` can still retrieve Firewalla's native
 - Network config execution requires a fresh matching hash.
 - Every network config plan or execution runs `networkConfigImpact` first.
 - Sensitive response keys are redacted.
+- The `[redacted]` placeholder is never written to the router.
 - Five raw network snapshots are kept only in manager memory for rollback.
 - A successful write refreshes the coordinator unless `refresh: false` is set.
 
